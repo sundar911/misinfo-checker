@@ -1,0 +1,7 @@
+# requirements.txt
+streamlit
+openai
+requests
+tldextract
+python-dotenv
+pandas
