@@ -15,6 +15,16 @@ MAX_QUERIES = 6
 # -------------------------
 # Secrets / Clients
 # -------------------------
+def _get_tavily_key():
+    try:
+        import streamlit as st
+        v = st.secrets.get("TAVILY_API_KEY")
+        if v: return v
+    except Exception:
+        pass
+    import os
+    return os.getenv("TAVILY_API_KEY")
+
 def _get_openai_key():
     try:
         import streamlit as st
@@ -110,10 +120,8 @@ def _fallback_queries(text: str) -> List[Dict]:
     base.append({"q": f"{short} data report", "intent": "data"})
     return base
 
-# -------------------------
-# Serper helpers
-# -------------------------
-def _serper(endpoint: str, payload: Dict) -> Dict:
+# --- Serper helpers -------------------------------------------------------
+def _serper(endpoint: str, payload: dict) -> dict:
     key = _get_serper_key()
     if not key:
         return {}
@@ -121,19 +129,65 @@ def _serper(endpoint: str, payload: Dict) -> Dict:
     url = f"{SERPER_URL}/{endpoint}"
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=SERPER_TIMEOUT)
-        return r.json() if r.ok else {}
-    except Exception:
+        if not r.ok:
+            # Leave a breadcrumb so we can see 403s in the terminal
+            print(f"[SERPER] {endpoint} HTTP {r.status_code}: {r.text[:300]}")
+            return {}
+        return r.json()
+    except Exception as e:
+        print(f"[SERPER] exception: {e}")
         return {}
+
+# --- DDG with backoff ----------------------------------------------------
+def _ddg_search(query: str, max_results: int = 10):
+    try:
+        from duckduckgo_search import DDGS
+        import time
+        out = []
+        # small batches + backoff to dodge 202 RateLimit
+        with DDGS() as ddgs:
+            got = 0
+            for r in ddgs.text(query, region="in-en", max_results=max_results):
+                out.append({
+                    "title": (r.get("title") or "")[:220],
+                    "link": r.get("href") or "",
+                    "snippet": (r.get("body") or "")[:300],
+                })
+                got += 1
+                if got % 5 == 0:
+                    time.sleep(1.2)
+        return out
+    except Exception as e:
+        print("[DDG] fallback error:", e)
+        return []
+
+# --- Tavily --------------------------------------------------------------
+def _tavily_search(query: str, max_results: int = 10):
+    key = _get_tavily_key()
+    if not key:
+        return []
+    try:
+        from tavily import TavilyClient
+        tv = TavilyClient(api_key=key)
+        res = tv.search(query=query, max_results=min(max_results, 10), include_answer=False)
+        out = []
+        for item in res.get("results", []):
+            out.append({
+                "title": (item.get("title") or "")[:220],
+                "link": item.get("url") or "",
+                "snippet": (item.get("content") or "")[:300],
+            })
+        return out
+    except Exception as e:
+        print("[TAVILY] error:", e)
+        return []
+
 
 # -------------------------
 # Public API
 # -------------------------
-def google_search(user_text: str, k: int = 6) -> List[Dict]:
-    """
-    Generate search queries via GPT, execute on Serper (web then news),
-    merge/dedupe, return up to k items of {title, link, snippet}.
-    """
-    # 1) Build queries (GPT → fallback)
+# --- Main search orchestrator -------------------------------------------
+def google_search(user_text: str, k: int = 6) -> list[dict]:
     try:
         plan = _generate_queries_via_gpt(user_text)
     except Exception:
@@ -141,37 +195,43 @@ def google_search(user_text: str, k: int = 6) -> List[Dict]:
     if not plan:
         plan = _fallback_queries(user_text)
 
-    # 2) Execute plan
-    results: Dict[str, Dict] = {}
+    results = {}
+    def _add(item):
+        link = item.get("link")
+        if link and link not in results:
+            results[link] = item
+
     for item in plan:
         q = item["q"]
-        # Try general web first
-        data = _serper("search", {"q": q, "num": 10})
-        for it in (data.get("organic") or []):
-            link = it.get("link")
-            if not link or link in results:
-                continue
-            results[link] = {
-                "title": (it.get("title") or "")[:220],
-                "link": link,
-                "snippet": (it.get("snippet") or "")[:300],
-            }
-            if len(results) >= k:
-                return list(results.values())[:k]
-        # Then try news if we still need more
-        if len(results) < k:
-            nd = _serper("news", {"q": q, "num": 10})
-            for it in (nd.get("news") or []):
-                link = it.get("link")
-                if not link or link in results:
-                    continue
-                results[link] = {
-                    "title": (it.get("title") or "")[:220],
-                    "link": link,
-                    "snippet": (it.get("snippet") or "")[:300],
-                }
-                if len(results) >= k:
-                    return list(results.values())[:k]
 
-    out = list(results.values())[:k]
-    return out
+        # 1) Tavily first
+        if len(results) < k:
+            for it in _tavily_search(q, max_results=10):
+                _add(it)
+                if len(results) >= k:
+                    break
+
+        # 2) Serper (if your key/plan works later)
+        if len(results) < k:
+            data = _serper("search", {"q": q, "num": 10, "gl": "in", "hl": "en"})
+            for it in (data.get("organic") or []):
+                _add({
+                    "title": (it.get("title") or "")[:220],
+                    "link": it.get("link") or "",
+                    "snippet": (it.get("snippet") or "")[:300],
+                })
+                if len(results) >= k:
+                    break
+
+        # 3) DDG fallback
+        if len(results) < k:
+            for it in _ddg_search(q, max_results=10):
+                _add(it)
+                if len(results) >= k:
+                    break
+
+        if len(results) >= k:
+            break
+
+    return list(results.values())[:k]
+
