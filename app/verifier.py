@@ -1,50 +1,66 @@
-# app/verifier.py
+# app/verifier.py (just replace verify_claim + helpers if needed)
+import tldextract
+import streamlit as st
 from openai import OpenAI
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-import os
 from app.search import google_search
 from app.bias_lookup import get_bias_info
-import tldextract
 
+def _get_openai_client():
+    key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
+    if not key:
+        import os
+        key = os.getenv("OPENAI_API_KEY")
+    return OpenAI(api_key=key)
 
-def extract_domain(url):
+def extract_domain(url: str) -> str:
     ext = tldextract.extract(url)
-    return f"{ext.domain}.{ext.suffix}"
+    return ".".join([p for p in [ext.domain, ext.suffix] if p])
 
-def verify_claim(text):
-    search_results = google_search(text)
-    sources_summary = ""
-    urls = []
+def _render_sources_block(results):
+    parts = []
+    for r in results:
+        domain = extract_domain(r["link"])
+        bias, cred = get_bias_info(domain)
+        parts.append(
+            f"**Source**: [{r['title']}]({r['link']})\n"
+            f"> {r.get('snippet','')}\n"
+            f"> 🧭 Bias: `{bias}` | 🛡️ Credibility: `{cred}`"
+        )
+    return "\n\n".join(parts) if parts else "_No relevant sources found._"
 
-    for result in search_results[:3]:
-        domain = extract_domain(result['link'])
-        bias, credibility = get_bias_info(domain)
-        sources_summary += f"\n**Source**: [{result['title']}]({result['link']})\n"
-        sources_summary += f"> {result['snippet']}\n"
-        sources_summary += f"> 🧭 Bias: `{bias}` | 🛡️ Credibility: `{credibility}`\n"
-        urls.append(result['link'])
+def verify_claim(text: str) -> str:
+    client = _get_openai_client()
 
-    # Prepare LLM prompt
+    results = google_search(text, k=6)
+    sources_md = _render_sources_block(results)
+
     prompt = f"""
-    Given the following message:
-    """
-    {text}
-    """
-    And the following information from web sources:
-    {sources_summary}
+You are a careful fact-checking assistant.
 
-    Assess whether the original message is true, false, or misleading. Provide a short justification.
-    """
+Message to assess:
+\"\"\"{text}\"\"\"
+
+From open web snippets (titles/snippets) below and your knowledge, provide:
+1) One-line verdict: True / False / Misleading / Unverified.
+2) 3–6 sentence justification grounded in the snippets or explain lack of reliable data.
+3) Missing context users should know.
+Avoid moralizing; be neutral and specific.
+
+Web snippets:
+{sources_md}
+"""
 
     try:
-        response = client.chat.completions.create(model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You are a fact-checking assistant."},
-            {"role": "user", "content": prompt}
-        ])
-        answer = response.choices[0].message.content
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Be rigorous, cite concrete facts, keep it concise."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        answer = resp.choices[0].message.content
     except Exception as e:
-        answer = f"Error verifying claim: {str(e)}"
+        answer = f"Error verifying claim: {e}"
 
-    return f"### ✅ Verdict\n\n{answer}\n\n---\n### 🔎 Sources\n{sources_summary}"
+    return f"### ✅ Verdict\n\n{answer}\n\n---\n### 🔎 Sources\n{sources_md}"
