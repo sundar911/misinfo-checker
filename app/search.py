@@ -1,237 +1,260 @@
 # app/search.py
 import os
-import re
+import json
+import time
+import random
+from typing import List, Dict, Any, Tuple
 import requests
-from typing import List, Dict
+import tldextract
 
-# -------------------------
-# Config
-# -------------------------
-OPENAI_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-4o-mini")  # keep it cheap/fast
-SERPER_URL = "https://google.serper.dev"
-SERPER_TIMEOUT = 18
-MAX_QUERIES = 6
+# --- Config ------------------------------------------------------------------
 
-# -------------------------
-# Secrets / Clients
-# -------------------------
-def _get_tavily_key():
-    try:
-        import streamlit as st
-        v = st.secrets.get("TAVILY_API_KEY")
-        if v: return v
-    except Exception:
-        pass
-    import os
-    return os.getenv("TAVILY_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # optional but recommended
 
-def _get_openai_key():
-    try:
-        import streamlit as st
-        v = st.secrets.get("OPENAI_API_KEY")
-        if v:
-            return v
-    except Exception:
-        pass
-    return os.getenv("OPENAI_API_KEY")
+# country preference for "Localize India" etc. ISO-2 (IN, US, AU ...)
+DEFAULT_COUNTRY = os.getenv("MISINFO_COUNTRY", "IN")
 
-def _get_serper_key():
-    try:
-        import streamlit as st
-        v = st.secrets.get("SERPER_API_KEY")
-        if v:
-            return v
-    except Exception:
-        pass
-    return os.getenv("SERPER_API_KEY")
+# Hard-coded “credible by default” domains (gov/intl/academia)
+FACTUAL_DOMAINS = [
+    "gov.in", "nic.in", "mea.gov.in", "mha.gov.in",
+    "who.int", "un.org", "oecd.org", "worldbank.org",
+    "imf.org", "data.gov", "census.gov", "nih.gov", "nber.org",
+    "gov.au", "abs.gov.au", "gov.uk", "ons.gov.uk", "europa.eu", "ec.europa.eu",
+    "ac.in", "edu", "ox.ac.uk", "cam.ac.uk", "harvard.edu", "mit.edu", "anu.edu.au",
+]
 
-def _openai_client():
-    from openai import OpenAI
-    key = _get_openai_key()
-    if not key:
-        raise RuntimeError("Missing OPENAI_API_KEY for query generation.")
-    return OpenAI(api_key=key)
+# Quick bias heuristics (loose). If bias_lookup.csv exists you can enrich later.
+LEAN_RIGHT_HINTS = ["breitbart", "foxnews", "thefederalist", "newsmax", "washingtontimes"]
+LEAN_LEFT_HINTS  = ["theguardian", "cnn.com", "msnbc", "vox.com", "huffpost"]
 
-# -------------------------
-# GPT query generation
-# -------------------------
-_SYSTEM = (
-    "You are a web research planner. Given a user message that may contain rumors, "
-    "opinions, or complex claims, produce 3-6 concise Google queries that a skilled "
-    "human would use to verify/understand the claims. Include a mix of: "
-    "1) fact-check queries, 2) data/official context queries, 3) broader background/context queries. "
-    "Queries must be short (<= 12 words), self-contained, and free of quotes or special characters "
-    "that hurt search matching. Avoid leading/trailing punctuation. "
-    "Return STRICT JSON: {\"queries\":[{\"q\":\"string\",\"intent\":\"fact-check|data|context\"}, ...]} "
-    "No extra text."
-)
+# --- OpenAI small helper ------------------------------------------------------
 
-_USER_TMPL = """Message:
-\"\"\"{text}\"\"\"
-
-Constraints:
-- 3 to 6 queries total
-- max 12 words each
-- use plain words that will match well on Google
-- choose intents from: fact-check, data, context
-"""
-
-def _generate_queries_via_gpt(text: str) -> List[Dict]:
-    client = _openai_client()
-    # Use JSON mode to force valid output
+def _oai_chat(system: str, user: str) -> str:
+    import openai  # uses v1 client (the new SDK)
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY missing")
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": _USER_TMPL.format(text=text)},
-        ],
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
         temperature=0.2,
+        max_tokens=500,
     )
-    raw = resp.choices[0].message.content
-    import json
-    data = json.loads(raw or "{}")
-    out = []
-    for item in (data.get("queries") or []):
-        q = (item.get("q") or "").strip()
-        intent = (item.get("intent") or "context").strip().lower()
-        if not q:
-            continue
-        if intent not in ("fact-check", "data", "context"):
-            intent = "context"
-        out.append({"q": q, "intent": intent})
-    # Conservative cap
-    return out[:MAX_QUERIES]
+    return resp.choices[0].message.content.strip()
 
-# -------------------------
-# Fallback heuristics (if GPT fails)
-# -------------------------
-def _shorten_for_query(t: str, max_words=12) -> str:
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"[^\x20-\x7E]+", " ", t)  # strip emojis/control chars
-    words = t.split()
-    return " ".join(words[:max_words]) if words else t
+# --- Query generation (now includes *implied* claims) ------------------------
 
-def _fallback_queries(text: str) -> List[Dict]:
-    short = _shorten_for_query(text)
-    base = [{"q": short, "intent": "context"}]
-    # add two mild variants
-    base.append({"q": f"{short} fact check", "intent": "fact-check"})
-    base.append({"q": f"{short} data report", "intent": "data"})
-    return base
+SYSTEM_CLAIMS = (
+    "You extract concise, Googleable claims from text. "
+    "Return JSON with `claims` (list of short claim strings). "
+    "Include both explicit factual claims *and* possible implied claims that a reader might infer."
+)
 
-# --- Serper helpers -------------------------------------------------------
-def _serper(endpoint: str, payload: dict) -> dict:
-    key = _get_serper_key()
-    if not key:
-        return {}
-    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
-    url = f"{SERPER_URL}/{endpoint}"
+SYSTEM_QUERIES = (
+    "You are a search-strategy assistant. For each claim, produce 2-4 efficient web search queries. "
+    "Diversify intents: facts/data (.gov/.edu/intl orgs), recent news, and background explainer. "
+    "Return JSON as {queries: [{claim: str, q: [strings]}]}."
+)
+
+def _extract_claims(text: str) -> List[str]:
+    js = _oai_chat(SYSTEM_CLAIMS, text)
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=SERPER_TIMEOUT)
-        if not r.ok:
-            # Leave a breadcrumb so we can see 403s in the terminal
-            print(f"[SERPER] {endpoint} HTTP {r.status_code}: {r.text[:300]}")
-            return {}
-        return r.json()
-    except Exception as e:
-        print(f"[SERPER] exception: {e}")
-        return {}
-
-# --- DDG with backoff ----------------------------------------------------
-def _ddg_search(query: str, max_results: int = 10):
-    try:
-        from duckduckgo_search import DDGS
-        import time
-        out = []
-        # small batches + backoff to dodge 202 RateLimit
-        with DDGS() as ddgs:
-            got = 0
-            for r in ddgs.text(query, region="in-en", max_results=max_results):
-                out.append({
-                    "title": (r.get("title") or "")[:220],
-                    "link": r.get("href") or "",
-                    "snippet": (r.get("body") or "")[:300],
-                })
-                got += 1
-                if got % 5 == 0:
-                    time.sleep(1.2)
-        return out
-    except Exception as e:
-        print("[DDG] fallback error:", e)
-        return []
-
-# --- Tavily --------------------------------------------------------------
-def _tavily_search(query: str, max_results: int = 10):
-    key = _get_tavily_key()
-    if not key:
-        return []
-    try:
-        from tavily import TavilyClient
-        tv = TavilyClient(api_key=key)
-        res = tv.search(query=query, max_results=min(max_results, 10), include_answer=False)
-        out = []
-        for item in res.get("results", []):
-            out.append({
-                "title": (item.get("title") or "")[:220],
-                "link": item.get("url") or "",
-                "snippet": (item.get("content") or "")[:300],
-            })
-        return out
-    except Exception as e:
-        print("[TAVILY] error:", e)
-        return []
-
-
-# -------------------------
-# Public API
-# -------------------------
-# --- Main search orchestrator -------------------------------------------
-def google_search(user_text: str, k: int = 6) -> list[dict]:
-    try:
-        plan = _generate_queries_via_gpt(user_text)
+        data = json.loads(js)
+        claims = [c.strip() for c in data.get("claims", []) if c.strip()]
+        return claims[:6] if claims else [text[:128]]
     except Exception:
-        plan = []
-    if not plan:
-        plan = _fallback_queries(user_text)
+        # very defensive fallback
+        return [text[:128]]
 
-    results = {}
-    def _add(item):
-        link = item.get("link")
-        if link and link not in results:
-            results[link] = item
+def _build_queries(claims: List[str]) -> List[str]:
+    payload = {"claims": claims}
+    js = _oai_chat(SYSTEM_QUERIES, json.dumps(payload, ensure_ascii=False))
+    try:
+        data = json.loads(js)
+        out = []
+        for item in data.get("queries", []):
+            out += [q.strip() for q in item.get("q", []) if q.strip()]
+        # de-dupe, keep order
+        seen = set(); uniq = []
+        for q in out:
+            if q.lower() not in seen:
+                seen.add(q.lower()); uniq.append(q)
+        return uniq[:12] if uniq else claims
+    except Exception:
+        return claims
 
-    for item in plan:
-        q = item["q"]
+# --- Provider: Tavily (primary) ----------------------------------------------
 
-        # 1) Tavily first
-        if len(results) < k:
-            for it in _tavily_search(q, max_results=10):
-                _add(it)
-                if len(results) >= k:
-                    break
+def _tavily_search(q: str, region: str | None, max_results: int = 5) -> List[Dict[str, Any]]:
+    if not TAVILY_API_KEY:
+        return []
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": q,
+                "max_results": max_results,
+                "search_depth": "basic",
+                "include_answer": False,
+                "include_domains": None,
+                "topic": "news" if "news" in q.lower() else "general",
+                "country": region,  # ISO-2 or None
+            },
+            timeout=18,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        results = data.get("results", [])
+        normalized = []
+        for r in results:
+            url = r.get("url", "")
+            title = r.get("title", "") or r.get("url", "")
+            snippet = r.get("content", "")[:280]
+            if url:
+                normalized.append({"title": title, "link": url, "snippet": snippet})
+        return normalized
+    except Exception:
+        return []
 
-        # 2) Serper (if your key/plan works later)
-        if len(results) < k:
-            data = _serper("search", {"q": q, "num": 10, "gl": "in", "hl": "en"})
-            for it in (data.get("organic") or []):
-                _add({
-                    "title": (it.get("title") or "")[:220],
-                    "link": it.get("link") or "",
-                    "snippet": (it.get("snippet") or "")[:300],
-                })
-                if len(results) >= k:
-                    break
+# --- Util: normalize + tag bias/credibility ----------------------------------
 
-        # 3) DDG fallback
-        if len(results) < k:
-            for it in _ddg_search(q, max_results=10):
-                _add(it)
-                if len(results) >= k:
-                    break
+def _domain(url: str) -> str:
+    ext = tldextract.extract(url)
+    dom = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
+    return dom.lower()
 
-        if len(results) >= k:
-            break
+def _guess_bias(domain: str) -> str:
+    d = domain.lower()
+    if any(h in d for h in LEAN_LEFT_HINTS):  return "Leans left (heuristic)"
+    if any(h in d for h in LEAN_RIGHT_HINTS): return "Leans right (heuristic)"
+    return "Unknown"
 
-    return list(results.values())[:k]
+def _guess_credibility(domain: str) -> str:
+    d = domain.lower()
+    if any(d.endswith(suffix) or d == suffix for suffix in FACTUAL_DOMAINS):
+        return "High (gov/intl/academia)"
+    return "Unrated"
 
+def _dedupe_keep_order(items: List[Dict[str, Any]], key="link") -> List[Dict[str, Any]]:
+    seen = set(); out = []
+    for it in items:
+        k = it.get(key)
+        if k and k not in seen:
+            seen.add(k); out.append(it)
+    return out
+
+# --- Challenge Modes ----------------------------------------------------------
+
+MODES = {
+    # factual, low-controversy first
+    "Just the facts": dict(
+        prefer_factual=True, opposing=False, localize=False, per_query=4, total=8
+    ),
+    # slight local preference + balanced mix
+    "Balanced mix": dict(
+        prefer_factual=False, opposing=True, localize=True, per_query=5, total=10
+    ),
+    # push users out of silo with clear opposing viewpoints included
+    "Break my silo": dict(
+        prefer_factual=True, opposing=True, localize=False, per_query=6, total=12
+    ),
+    # short + explanatory about manipulation
+    "Explain manipulative framing": dict(
+        prefer_factual=True, opposing=False, localize=False, per_query=4, total=8
+    ),
+    # India-first lens (change DEFAULT_COUNTRY to user setting in UI)
+    "Localize India": dict(
+        prefer_factual=False, opposing=True, localize=True, per_query=5, total=10
+    ),
+}
+
+def _blend_sources(rows: List[Dict[str, Any]], opposing: bool) -> List[Dict[str, Any]]:
+    """Optionally ensure ideologically diverse mix."""
+    if not opposing:
+        return rows
+    left, right, unknown = [], [], []
+    for r in rows:
+        b = r.get("bias", "Unknown")
+        if "left" in b.lower(): left.append(r)
+        elif "right" in b.lower(): right.append(r)
+        else: unknown.append(r)
+    # Interleave right/left, then fill unknown
+    mixed = []
+    while left or right:
+        if left: mixed.append(left.pop(0))
+        if right: mixed.append(right.pop(0))
+    mixed += unknown
+    return mixed
+
+# --- Public API ---------------------------------------------------------------
+
+def search_message(message: str,
+                   mode: str = "Balanced mix",
+                   per_query: int = 5) -> List[Dict[str, Any]]:
+    """
+    Returns normalized results: [{title, link, snippet, bias, credibility, why_included}]
+    """
+    cfg = MODES.get(mode, MODES["Balanced mix"])
+    per_query = cfg.get("per_query", per_query)
+
+    claims = _extract_claims(message)
+    queries = _build_queries(claims)
+
+    # Bias queries toward factual when requested
+    factual_queries = []
+    if cfg["prefer_factual"]:
+        for c in claims[:3]:
+            factual_queries += [
+                f"{c} site:.gov OR site:.edu OR site:who.int OR site:un.org",
+                f"{c} methodology site:.gov OR site:.edu",
+            ]
+    queries = factual_queries + queries
+
+    all_rows: List[Dict[str, Any]] = []
+
+    for q in queries:
+        # local vs global runs if localize True
+        regions: List[Tuple[str | None, str]] = [ (None, "global") ]
+        if cfg["localize"]:
+            regions.insert(0, (DEFAULT_COUNTRY, f"local:{DEFAULT_COUNTRY}"))
+
+        for region_code, tag in regions:
+            rows = _tavily_search(q, region_code, max_results=per_query)
+            for r in rows:
+                dom = _domain(r["link"])
+                row = {
+                    "title": r["title"],
+                    "link": r["link"],
+                    "snippet": r["snippet"],
+                    "domain": dom,
+                    "bias": _guess_bias(dom),
+                    "credibility": _guess_credibility(dom),
+                    "why_included": f"Query='{q}' scope={tag}",
+                }
+                all_rows.append(row)
+        # be nice to APIs
+        time.sleep(0.25 + random.random() * 0.25)
+
+    # De-dupe and blend per opposing flag
+    all_rows = _dedupe_keep_order(all_rows)
+    all_rows = _blend_sources(all_rows, opposing=cfg["opposing"])
+
+    # Cap total
+    total = cfg.get("total", 10)
+    return all_rows[:total]
+
+# Back-compat shim used by verifier.py
+def google_search(message, k=6, mode: str = "Balanced mix"):
+    results = search_message(message, mode=mode, per_query=max(3, k))
+    # Keep only fields verifier expects (title/link/snippet) + our tags
+    return [{"title": r["title"],
+             "link": r["link"],
+             "snippet": r["snippet"],
+             "bias": r["bias"],
+             "credibility": r["credibility"],
+             "why_included": r["why_included"]} for r in results]

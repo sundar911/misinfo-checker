@@ -1,61 +1,58 @@
-# app/verifier.py (just replace verify_claim + helpers if needed)
-import tldextract
-import streamlit as st
+# app/verifier.py
+import os
 from openai import OpenAI
 from app.search import google_search
-from app.bias_lookup import get_bias_info
 
-def _get_openai_client():
-    key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
-    if not key:
-        import os
-        key = os.getenv("OPENAI_API_KEY")
-    return OpenAI(api_key=key)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def extract_domain(url: str) -> str:
-    ext = tldextract.extract(url)
-    return ".".join([p for p in [ext.domain, ext.suffix] if p])
+SYSTEM_VERIFIER = (
+    "You are a careful misinformation checker. "
+    "Given a user message and a set of sources (titles+urls+snippets), "
+    "produce a succinct verdict and a short structured explanation. "
+    "Possible verdicts: True, False, Misleading, Uncertain. "
+    "If sources don’t directly resolve a claim, say so and advise what would be needed."
+)
 
-def _render_sources_block(results):
-    parts = []
+def verify_claim(text: str, mode: str = "Balanced mix"):
+    # 1) search
+    results = google_search(text, k=6, mode=mode)
+
+    if not results:
+        return {
+            "verdict_md": "### ⚠️ No sources found\nTry rephrasing your message or switching modes.",
+            "sources": []
+        }
+
+    # 2) prepare prompt
+    src_lines = []
     for r in results:
-        domain = extract_domain(r["link"])
-        bias, cred = get_bias_info(domain)
-        parts.append(
-            f"**Source**: [{r['title']}]({r['link']})\n"
-            f"> {r.get('snippet','')}\n"
-            f"> 🧭 Bias: `{bias}` | 🛡️ Credibility: `{cred}`"
+        src_lines.append(
+            f"- {r['title']} ({r['link']})\n  {r['snippet']}\n  "
+            f"Bias: {r.get('bias','Unknown')} | Credibility: {r.get('credibility','Unrated')} | {r.get('why_included','')}"
         )
-    return "\n\n".join(parts) if parts else "_No relevant sources found._"
+    src_block = "\n".join(src_lines)
 
-def verify_claim(text: str) -> str:
-    client = _get_openai_client()
-
-    results = google_search(text, k=6)
-    sources_md = _render_sources_block(results)
-
-    prompt = f"""
-You are a careful fact-checking assistant.
-
-Message to assess:
+    user_prompt = f"""Message to assess:
 \"\"\"{text}\"\"\"
 
-From open web snippets (titles/snippets) below and your knowledge, provide:
-1) One-line verdict: True / False / Misleading / Unverified.
-2) 3–6 sentence justification grounded in the snippets or explain lack of reliable data.
-3) Missing context users should know.
-Avoid moralizing; be neutral and specific.
+Sources:
+{src_block}
 
-Web snippets:
-{sources_md}
+Return Markdown with:
+- **Verdict:** <True/False/Misleading/Uncertain>
+- **Justification:** 3-6 bullet points
+- **Missing context or open questions:** (optional, if applicable)
 """
 
+    # 3) LLM call
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "Be rigorous, cite concrete facts, keep it concise."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": SYSTEM_VERIFIER},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
         )
@@ -63,4 +60,8 @@ Web snippets:
     except Exception as e:
         answer = f"Error verifying claim: {e}"
 
-    return f"### ✅ Verdict\n\n{answer}\n\n---\n### 🔎 Sources\n{sources_md}"
+    # 4) Return for UI
+    return {
+        "verdict_md": answer,
+        "sources": results
+    }
